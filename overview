@@ -1,0 +1,199 @@
+Overview
+
+I implement a Reverse Fokker–Planck (RFP) pipeline to reconstruct and forecast implied volatility (IV). The notebook contains three main parts:
+
+reverse_fokker_planck_forecast(...) — the model and forecasting routine.
+
+Option-chain parsing and IV time-series construction.
+
+Rolling-window backtest comparing model forecasts to realized IV.
+
+Below I explain each block, line-by-line intent, the mathematical assumptions, potential pitfalls, and recommended corrections for robustness and publication quality.
+
+A. reverse_fokker_planck_forecast(history, horizon, ...) — purpose & algorithm
+
+Purpose. Given a one-dimensional historical IV series history (most recent last), this function: (1) fits a parsimonious stochastic volatility model (expOU), (2) integrates the time-reversed Fokker–Planck PDE for the fitted dynamics, (3) synthesizes Monte-Carlo paths under the expOU dynamics, and (4) returns a point forecast (the ensemble mean at the horizon).
+
+Code flow and interpretation
+
+log_iv = np.log(history)
+Convert IV to log scale; the expOU model operates on log-IV.
+
+log_diff = np.diff(log_iv)
+First differences of log-IV (used to estimate short scale m and transform for Y).
+
+m_hat = np.std(log_diff)
+Estimate a short scale parameter m̂ as the standard deviation of log differences. Interpreted as small-scale noise amplitude.
+
+Y = np.log(np.abs(log_diff) / m_hat)
+Transform increments to a proxy for the underlying OU state increments. Caveat: if any log_diff == 0 this produces log(0) → -inf or error. Must guard against zeros or extremely small values.
+
+Y_lag = Y[:-1] and Y_next = Y[1:]
+Prepare lagged pairs for regression.
+
+alpha_hat = -np.polyfit(Y_lag, Y_next - Y_lag, 1)[0]
+Estimate mean reversion speed α̂ by regressing (Y_next - Y_lag) on Y_lag. The negative sign enforces the OU mean-reversion convention. Note: the regression formulation can be noisy; better to use MLE for OU or Kalman filtering for robustness.
+
+k_hat = np.std(Y_next - (Y_lag - alpha_hat * Y_lag))
+Estimate vol-of-vol k̂ from residuals. (This formula in the notebook has minor algebraic oddities — see “recommended fixes” below.)
+
+Fokker-Planck PDE:
+
+Build a log-IV grid x = np.linspace(-x_lim, x_lim, n_grid) and spacing dx.
+
+Set T = horizon and t_eval = np.linspace(0, T, n_time).
+
+mean_log_iv = np.mean(log_iv) and rho0 = norm.pdf(x, loc=mean_log_iv, scale=m_hat); rho0 /= np.trapz(rho0, x)
+Initialize the density at the present as a Gaussian centered on the mean log-IV with scale m_hat, and normalize.
+
+def fp_rev(t, rho): ... return drift * d_rho_dx - diffusion * d2_rho_dx2
+The right-hand side encodes the time-reversed Fokker–Planck operator: drift * ∂ρ/∂x − diffusion * ∂²ρ/∂x². Here drift = -alpha_hat * x and diffusion = 0.5 * k_hat**2.
+
+sol = solve_ivp(fp_rev, [T, 0], rho0, t_eval=t_eval[::-1], method='RK45')
+Numerically integrate backward in time from T to 0. t_eval[::-1] arranges output times in forward order. Caveats: RK45 is explicit and may be unstable for stiff PDE-like operators; densities can become negative or non-normalized. For publication, consider Crank–Nicolson or other implicit schemes and implement boundary conditions and renormalization at each step.
+
+Monte Carlo simulation:
+
+Simulate n_paths sample trajectories of the expOU representation:
+
+Y_val evolves as Y_{t+1} = Y_t + (-alpha_hat * Y_t) + k_hat * Normal().
+
+Volatility sigma = m_hat * exp(Y_val) and IV multiplicatively updates: IV_{t+1} = IV_t * exp(Normal(0, sigma)).
+
+return float(np.mean(paths[:, horizon])) returns the ensemble mean IV at the horizon.
+
+Key assumptions & limitations in this function
+
+Unit consistency: history must be in decimal (e.g., 0.25 for 25%). If series are in percent (25), all estimates and PDE use are invalid by factors of 100. Always normalize units before calling this function.
+
+Numerical stability: solve_ivp with explicit RK45 may produce negative densities. Enforce positivity and renormalize ρ after each time step, or use a stable implicit discretization.
+
+Parameter estimation consistency: the heuristic regression approach can be fragile with small history windows. For publication quality, replace with MLE for OU or state-space estimation (Kalman / EM).
+
+Edge cases: guard against log_diff == 0 and missing values; add small epsilon floor to avoid log(0).
+
+B. Option-chain parsing & IV time-series construction
+
+What it does: Find all files matching '/mnt/data/* Option Chain.txt' and build a date-indexed series df_iv where each date’s IV equals the mean implied volatility across strikes in the snapshot.
+
+Key lines and issues:
+
+chain_files = glob.glob(file_pattern) — collects candidate files. Ensure file naming is consistent.
+
+m = re.search(r"/(.+?) Option Chain\.txt$", file) then date = pd.to_datetime(m.group(1)) if m else None — parses a date from the filename (e.g. "May 16 2025 Option Chain.txt"). Pitfall: parsing fails if filenames are not exactly in that pattern or use other separators; pd.to_datetime may require format or locale.
+
+df_chain = pd.read_csv(file, sep=' ', skiprows=1) — reading tab-separated files. The literal tab must match the file; using sep='\t' is more robust.
+
+iv_col = 'Implied Volatility' — ensure this exact column name exists in every file. Otherwise the code raises KeyError.
+
+df_chain['IV_decimal'] = df_chain[iv_col].apply(lambda x: float(str(x).rstrip('%')) / 100) — convert values like '25%' to 0.25. Pitfall: if the file already has decimals (0.25) or numeric dtype, strip/convert logic will break or yield incorrect value. Add a guard:
+
+def to_decimal(v):
+    if isinstance(v, str) and '%' in v:
+        return float(v.strip().rstrip('%'))/100.0
+    else:
+        return float(v)
+df_chain['IV_decimal'] = df_chain[iv_col].map(to_decimal)
+
+
+avg_iv = df_chain['IV_decimal'].mean() — the prototype averages across strikes. For publication, do not average unless you justify it. Prefer selecting ATM strike with fixed tenor across dates to preserve comparability.
+
+Build df_iv = pd.DataFrame(records).dropna().sort_values('Date') and df_iv.set_index('Date', inplace=True) — final IV timeseries.
+
+C. Rolling backtest
+
+What it does: Run a rolling window forecast for horizon = 1 day using lookback = 60:
+
+For i from lookback to n-horizon, extract history = iv_vals[i-lookback:i], call reverse_fokker_planck_forecast(history, horizon), and compare pred to true = iv_vals[i + horizon]. Collect preds, acts, dates.
+
+Compute metrics:
+
+mse  = mean_squared_error(acts, preds)
+mae  = mean_absolute_error(acts, preds)
+rmse = np.sqrt(mse)
+
+
+Assemble results DataFrame:
+
+results = pd.DataFrame({'Actual_IV': acts, 'Predicted_IV': preds}, index=pd.to_datetime(dates))
+
+
+Publication notes:
+
+Report MAE and RMSE with units clearly stated (e.g., IV in decimal). If the metrics are large, show df_iv.describe() and sample Actual vs Predicted plots to justify scaling.
+
+Provide baseline benchmarks (random walk, AR(1), GARCH) and test statistical significance (Diebold-Mariano or Diebold-Mariano-West test) when claiming forecast superiority.
+
+D. Practical corrections & recommended code fixes (copy-paste ready)
+
+Robust IV conversion routine (replace current apply):
+
+def to_decimal(v):
+    # handle '25%', 25, 0.25 safely
+    if pd.isna(v):
+        return np.nan
+    s = str(v).strip()
+    if s.endswith('%'):
+        return float(s.rstrip('%')) / 100.0
+    else:
+        try:
+            fv = float(s)
+        except:
+            return np.nan
+        # if fv > 5: treat as percent (heuristic)
+        return fv/100.0 if fv > 5 else fv
+
+df_chain['IV_decimal'] = df_chain[iv_col].map(to_decimal)
+
+
+Safer tab read & filename parsing:
+
+chain_files = sorted(glob.glob('/mnt/data/*Option Chain*.txt'))
+records = []
+for f in chain_files:
+    # attempt to extract date with several patterns
+    base = os.path.basename(f)
+    # pattern: 'May 16 2025 Option Chain.txt' or '2025-05-16 Option Chain.txt'
+    try:
+        date = pd.to_datetime(re.search(r'(\w+ \d{1,2} \d{4})', base).group(1))
+    except:
+        try:
+            date = pd.to_datetime(re.search(r'(\d{4}-\d{2}-\d{2})', base).group(1))
+        except:
+            date = None
+    df_chain = pd.read_csv(f, sep='\t', skiprows=1, engine='python')
+    # ...
+
+
+Guard against zero differences in parameter estimation:
+
+epsilon = 1e-10
+log_diff = np.diff(log_iv)
+log_diff = np.where(np.abs(log_diff) < epsilon, np.sign(log_diff)*epsilon, log_diff)
+
+
+Better OU parameter estimation (MLE): use standard OU MLE or least squares from continuous-time discretization. Example quick improvement:
+
+# estimate OU params via regression: dY = -alpha*Y*dt + k*dW
+Y = log_iv - np.mean(log_iv)  # or appropriate transform
+dY = np.diff(Y)
+Y_lag = Y[:-1]
+# discrete regression dY = -alpha * Y_lag * dt + noise
+alpha_hat = - np.sum(Y_lag * dY) / np.sum(Y_lag**2)  # approximate
+# then estimate k_hat from residuals
+resid = dY + alpha_hat * Y_lag
+k_hat = np.std(resid) * np.sqrt(len(resid))  # adjust for dt if needed
+
+
+PDE stability: Use implicit Crank–Nicolson if possible, or at least renormalize rho at each t step and impose reflective/absorbing boundary conditions on x extremes.
+
+Monte Carlo reproducibility: set np.random.seed(12345) in the function or pass rng as an argument.
+
+Units check early: Add this at the start of the backtest cell:
+
+print('IV series description:')
+print(df_iv['IV'].describe())
+# if max > 5 => likely percent; convert:
+if df_iv['IV'].max() > 5:
+    print('Converting IV from percent to decimal...')
+    df_iv['IV'] = df_iv['IV'] / 100.0
